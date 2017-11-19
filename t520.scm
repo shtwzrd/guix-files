@@ -1,52 +1,72 @@
-(use-modules (gnu) (gnu services) (guix gexp) (gnu system nss) (gnu services xorg))
-(use-service-modules networking shepherd)
-(use-package-modules admin linux certs xorg fonts vim freedesktop)
+(use-modules (gnu)
+             (gnu system nss)
+             (gnu services base)
+             (gnu services desktop)
+             (gnu services avahi)
+             (gnu services networking)
+             (gnu services xorg)
+             (gnu services dbus))
 
-(define powertop-tuning-service-type
-  (shepherd-service-type
-   'powertop-tuning
-   (lambda _
-     (shepherd-service
-      (documentation "Auto-tune powertop tunables to increase battery life")
-      (provision '(powertop-tuning))
-      (start #~(lambda _
-                 (zero? (system* (string-append #$powertop "/sbin/powertop")
-                                 "--auto-tune"))))
-      (respawn? #f)))))
+(use-package-modules certs nvi admin libusb freedesktop avahi xdisorg suckless fonts)
 
-(define wpa-supplicant-service-type
-  (shepherd-service-type
-   'wpa-supplicant
-   (lambda (arg)
-     (let ((interface (car arg))
-           (config-file (cadr arg)))
-      (shepherd-service
-       (documentation "WiFi association daemon")
-       (provision '(wpa-supplicant))
-       (start #~(make-forkexec-constructor
-                 (list (string-append #$wpa-supplicant-minimal "/sbin/wpa_supplicant")
-                       "-i" #$interface
-                       "-c" #$config-file)))
-       (stop #~(make-kill-destructor))
-       (respawn? #t))))))
+(define libinput.conf "
+# Match on all types of devices but tablet devices and joysticks
+Section \"InputClass\"
+        Identifier \"libinput pointer catchall\"
+        MatchIsPointer \"on\"
+        MatchDevicePath \"/dev/input/event*\"
+        Driver \"libinput\"
+EndSection
 
-(define (powertop-tuning-service)
-  (service powertop-tuning-service-type '()))
+Section \"InputClass\"
+        Identifier \"libinput keyboard catchall\"
+        MatchIsKeyboard \"on\"
+        MatchDevicePath \"/dev/input/event*\"
+        Driver \"libinput\"
+EndSection
 
-(define (wpa-supplicant-service interface config-file)
-  (service wpa-supplicant-service-type (list interface config-file)))
+Section \"InputClass\"
+        Identifier \"libinput touchpad catchall\"
+        MatchIsTouchpad \"on\"
+        MatchDevicePath \"/dev/input/event*\"
+        Driver \"libinput\"
+        Option \"ClickMethod\" \"clickfinger\"
+        Option \"Tapping\" \"on\"
+EndSection
+
+Section \"InputClass\"
+        Identifier \"libinput touchscreen catchall\"
+        MatchIsTouchscreen \"on\"
+        MatchDevicePath \"/dev/input/event*\"
+        Driver \"libinput\"
+EndSection
+
+Section \"InputClass\"
+        Identifier \"libinput tablet catchall\"
+        MatchIsTablet \"on\"
+        MatchDevicePath \"/dev/input/event*\"
+        Driver \"libinput\"
+EndSection
+")
 
 (operating-system
   (host-name "t520")
   (timezone "Europe/Copenhagen")
-  (locale "en_US.UTF-8")
+  (locale "en_US.utf8")
 
   (bootloader (grub-configuration (device "/dev/sda")))
 
+  (mapped-devices
+    (list (mapped-device
+            (source (uuid "d9042cc1-f42f-4165-aade-1ecd954e334c"))
+            (target "rootvol")
+            (type luks-device-mapping))))
+
   (file-systems (cons (file-system
-                        (device "my-root")
+                        (device "rootvol")
                         (title 'label)
                         (mount-point "/")
+                        (dependencies mapped-devices)
                         (type "ext4"))
                       %base-file-systems))
 
@@ -54,31 +74,47 @@
                 (name "blu")
                 (group "users")
                 (supplementary-groups '("wheel" "netdev"
-					"video" "input"))
+                                        "audio" "video"))
                 (home-directory "/home/blu"))
                %base-user-accounts))
 
-  ;; This is where we specify system-wide packages.
-  (packages (cons* nss-certs         ;for HTTPS access
+  (packages (cons* nvi
+                   wpa-supplicant
                    font-dejavu
-                   xf86-video-nouveau
-                   xf86-video-intel
-                   xf86-input-libinput
-                   xorg-server
-		   libinput
-                   xinit
-
-                   vim
-
+                   nss-certs                      ;for HTTPS access
                    %base-packages))
 
- (setuid-programs (cons* #~(string-append #$xorg-server "/bin/Xorg")
-                         %setuid-programs))
+(services
+  (cons* (slim-service
+           #:allow-empty-passwords? #f
+	   #:auto-login? #f
+           #:startx (xorg-start-command
+		   #:configuration-file
+		     (xorg-configuration-file
+		       #:extra-config (list libinput.conf))))
+         ;; Screen lockers are a pretty useful thing and these are small.
+         (screen-locker-service slock)
+         (screen-locker-service xlockmore "xlock")
+         ;; Add udev rules for MTP devices so that non-root users can access
+         ;; them.
+         (simple-service 'mtp udev-service-type (list libmtp))
+         (xfce-desktop-service)
 
-  (services (cons* (powertop-tuning-service)
-                   (wpa-supplicant-service "wlp2s0" "/home/blu/.config/wpa_supplicant.conf")
-                   (dhcp-client-service)
-                   %base-services))
+         ;; The D-Bus clique.
+         (service network-manager-service-type)
+         (service wpa-supplicant-service-type)    ;needed by NetworkManager
+;;         (avahi-service)
+;;         (udisks-service)
+;;         (upower-service)
+;;         (accountsservice-service)
+;;         (colord-service)
+;;         (geoclue-service)
+         (polkit-service)
+         (elogind-service)
+         (dbus-service)
+         %base-services))
+
 
   ;; Allow resolution of '.local' host names with mDNS.
   (name-service-switch %mdns-host-lookup-nss))
+
